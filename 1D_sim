@@ -1,0 +1,849 @@
+// tokamak_fusion_gui_v2.cpp
+// 1D radial transport + 3D + improved UI: DPI scaling, fullscreen, cleaner layout
+// Build (MSYS2 MinGW 64-bit):
+//   g++ -O2 -std=c++17 tokamak_fusion_gui_v2.cpp -o tokamak_fusion_gui_v2.exe -lfreeglut -lglu32 -lopengl32 -lm
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <cctype>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <GL/gl.h>
+#include <GL/glu.h>
+#include <GL/glut.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// -----------------------------------------------------------------------------
+// UI scaling + helpers
+// -----------------------------------------------------------------------------
+struct UI {
+    float scale = 1.20f;                // default looks good on 1080p; use U/Shift+U to change
+    int   gap() const       { return (int)std::round(10*scale); }
+    int   pad() const       { return (int)std::round(8*scale); }
+    int   lineStep() const  { return (int)std::round(22*scale); }
+    int   titleStep() const { return (int)std::round(24*scale); }
+    int   panelMinW() const { return (int)std::round(420*scale); }
+    int   insetW(int W)const{ return (int)std::round(0.40f*W); }
+    int   insetH(int H)const{ return (int)std::round(0.46f*H); }
+} UIX;
+
+// -----------------------------------------------------------------------------
+// Physics params (same as your 1D version)
+// -----------------------------------------------------------------------------
+struct Params {
+    double R0  = 1.7;
+    double a   = 0.6;
+    double n_m3     = 1e20;
+    double T0_keV   = 5.0;
+    double Pext_Wm3 = 1e6;
+    double Crad     = 0.0;
+    double fracD    = 0.5;
+    bool   autoTau  = false;
+    double tauE_s   = 1.0;
+    double B0_T  = 5.3;
+    double Ip_MA = 10.0;
+    double kappa = 1.7;
+    // 1D extras
+    double chi_m2s     = 1.0;
+    double T_edge_keV  = 0.2;
+    double pext_peak   = 1.5;
+};
+static constexpr double kB=1.380649e-23, eV=1.602176634e-19, KperkeV=1.160451812e7;
+static constexpr double E_DT=17.6e6*eV, f_alpha=3.5/17.6;
+static const std::vector<std::pair<double,double>> dt_reactivity = {
+    {2.0,2.0e-24},{5.0,1.0e-23},{10.0,1.0e-22},{15.0,3.0e-22},
+    {20.0,6.0e-22},{30.0,8.0e-22},{50.0,1.0e-21},{100.0,1.1e-21}
+};
+static inline double reactivity_DT(double T){
+    T=std::max(1e-3,T);
+    if(T<=dt_reactivity.front().first) return dt_reactivity.front().second;
+    if(T>=dt_reactivity.back().first)  return dt_reactivity.back().second;
+    for(size_t i=1;i<dt_reactivity.size();++i){
+        if(T<=dt_reactivity[i].first){
+            auto [T0,r0]=dt_reactivity[i-1]; auto [T1,r1]=dt_reactivity[i];
+            double w=(T-T0)/(T1-T0); return r0+w*(r1-r0);
+        }
+    }
+    return dt_reactivity.back().second;
+}
+static inline double torus_volume(double R0,double a){ return 2.0*M_PI*M_PI*R0*a*a; }
+
+// -----------------------------------------------------------------------------
+// App state (includes your 1D solver state)
+// -----------------------------------------------------------------------------
+struct State {
+    Params P;
+    double t=0; bool paused=false;
+
+    // 1D radial grid
+    static constexpr int Nr=64;
+    double dr=0.01;
+    std::vector<double> Tr, dTr;
+    int edgeBC = 0; // 0=Dirichlet, 1=Neumann
+
+    // Diagnostics (averaged)
+    double Pfus_avg=0, Palpha_avg=0, Pext_avg=0, Prad_avg=0, Ploss_avg=0;
+    double Tcenter=0, Tavg=0, U_avg=0;
+
+    // Camera
+    float camYaw=25.f, camPitch=15.f, camDist=4.0f;
+
+    // Time graph buffers (center T)
+    static constexpr int Nplot=900;
+    std::vector<double> gt, gT, gPfus, gPloss;
+    int head=0; bool wrapped=false;
+
+    // Panel edit
+    bool edit=false; int sel=0; bool typing=false; std::string buf="";
+
+    // Mouse
+    int mBtn=0, lastX=0, lastY=0;
+
+    // Logging
+    bool logging=false; FILE* logf=nullptr;
+
+    // Controller
+    bool ctrlOn=false; double targetT_keV=15.0; double Kp=2e5;
+
+    // Toggles
+    bool showPfus=false, showPloss=false, showProfileInset=true;
+    bool explain=false, showLab=false, showHelp=false;
+
+    // Probe
+    bool probeActive=false; int probeIdx=0;
+    double probe_t=0, probe_T=0, probe_Pfus=0, probe_Ploss=0;
+
+    // Fullscreen
+    bool isFullscreen=false;
+} S;
+
+// Presets (unchanged content)
+struct Preset { const char* name; Params p; };
+std::vector<Preset> PRESETS = {
+  {"MiniTok-1D", []{ Params p; p.R0=1.2; p.a=0.35; p.n_m3=6e19; p.Pext_Wm3=3e5; p.T0_keV=3.0; p.tauE_s=0.3; p.chi_m2s=0.8; p.T_edge_keV=0.2; p.pext_peak=1.3; return p; }()},
+  {"LargeTok-1D",[]{ Params p; p.R0=3.0; p.a=1.0; p.n_m3=1e20; p.Pext_Wm3=1e6; p.T0_keV=5.0; p.tauE_s=2.0; p.chi_m2s=1.2; p.T_edge_keV=0.3; p.pext_peak=1.6; return p; }()},
+  {"ITER-ish-1D",[]{ Params p; p.R0=6.2; p.a=2.0; p.n_m3=1e20; p.B0_T=5.3; p.Ip_MA=15; p.kappa=1.7; p.autoTau=true; p.Pext_Wm3=8e5; p.T0_keV=8.0; p.chi_m2s=1.0; p.T_edge_keV=0.2; p.pext_peak=1.8; return p; }()},
+  {"DEMO-ish-1D",[]{ Params p; p.R0=9.0; p.a=3.0; p.n_m3=1.2e20; p.B0_T=6; p.Ip_MA=20; p.kappa=1.8; p.autoTau=true; p.Pext_Wm3=6e5; p.T0_keV=10.0; p.chi_m2s=0.9; p.T_edge_keV=0.25; p.pext_peak=2.0; return p; }()},
+};
+
+// -----------------------------------------------------------------------------
+// 1D physics helpers (same as before, tidied)
+// -----------------------------------------------------------------------------
+static inline double r_face(int i){ return std::min(S.P.a, std::max(0.0, i*S.dr)); }
+static inline double r_cell(int i){ return (i+0.5)*S.dr; }
+
+double pext_profile_norm(){
+    double num=0, den=0;
+    for(int i=0;i<S.Nr;i++){
+        double r=r_cell(i), x=r/S.P.a;
+        double f = pow(std::max(0.0, 1.0 - x*x), std::max(0.0, S.P.pext_peak));
+        num += r * f;
+        den += r;
+    }
+    return (den>0) ? (num/den) : 1.0;
+}
+double Pext_local(int i){
+    double norm = pext_profile_norm();
+    double r=r_cell(i), x=r/S.P.a;
+    double f = pow(std::max(0.0, 1.0 - x*x), std::max(0.0, S.P.pext_peak));
+    return (norm>1e-12) ? (S.P.Pext_Wm3 * f / norm) : S.P.Pext_Wm3;
+}
+double Prad_local(int i){ double n=S.P.n_m3; return S.P.Crad * n*n * sqrt(std::max(1e-6, S.Tr[i])); }
+double Pfus_local(int i){
+    double n=S.P.n_m3, nD=S.P.fracD*n, nT=(1.0-S.P.fracD)*n;
+    return nD*nT*reactivity_DT(S.Tr[i])*E_DT;
+}
+double Palpha_local(int i){ return f_alpha * Pfus_local(i); }
+
+// (1/r) d/dr( r χ dT/dr )
+double diffTerm_cyl(int i){
+    double chi=S.P.chi_m2s;
+    double ri = r_cell(i);
+    double rfL = r_face(i), rfR = r_face(i+1);
+
+    double TL = (i==0) ? S.Tr[0] : S.Tr[i-1];
+    double TR;
+    if(i==S.Nr-1){
+        TR = (S.edgeBC==0)? S.P.T_edge_keV : S.Tr[i];
+    } else TR = S.Tr[i+1];
+
+    double dTdr_L = (S.Tr[i] - TL) / S.dr;
+    double dTdr_R = (TR - S.Tr[i]) / S.dr;
+
+    double flux_L = rfL * chi * dTdr_L;
+    double flux_R = rfR * chi * dTdr_R;
+
+    if(ri < 1e-9) return (flux_R - flux_L) / (0.5*S.dr*S.dr);
+    return (flux_R - flux_L) / (ri * S.dr);
+}
+
+void updateDiagnostics(){
+    double V = torus_volume(S.P.R0,S.P.a);
+    double wsum=0, Tsum=0, Pfus_sum=0, Pext_sum=0, Prad_sum=0;
+    for(int i=0;i<S.Nr;i++){
+        double w = r_cell(i);
+        wsum += w;
+        Tsum += w * S.Tr[i];
+        Pfus_sum += w * Pfus_local(i);
+        Pext_sum += w * Pext_local(i);
+        Prad_sum += w * Prad_local(i);
+    }
+    S.Tcenter = S.Tr[0];
+    S.Tavg = (wsum>0)? Tsum/wsum : S.Tr[0];
+    S.Pfus_avg   = (wsum>0)? Pfus_sum/wsum : 0.0;
+    S.Pext_avg   = (wsum>0)? Pext_sum/wsum : 0.0;
+    S.Prad_avg   = (wsum>0)? Prad_sum/wsum : 0.0;
+    S.Palpha_avg = f_alpha * S.Pfus_avg;
+
+    // edge flux → average loss
+    double grad_edge = (S.edgeBC==0)? (S.P.T_edge_keV - S.Tr[S.Nr-1])/S.dr : 0.0;
+    double q = - S.P.chi_m2s * 3.0*S.P.n_m3*kB*KperkeV * grad_edge;
+    double A_edge = 2.0*M_PI*M_PI * S.P.R0 * S.P.a;
+    double Ploss_tot = q * A_edge;
+    S.Ploss_avg = std::max(0.0, Ploss_tot / std::max(1e-12, V));
+
+    S.U_avg = 3.0*S.P.n_m3*kB*(S.Tavg*KperkeV);
+}
+
+void compute_dTr(std::vector<double>& dT){
+    dT.assign(S.Nr, 0.0);
+    double denom = (3.0*S.P.n_m3*kB)*KperkeV;
+    for(int i=0;i<S.Nr;i++){
+        double src = Palpha_local(i) + Pext_local(i) - Prad_local(i);
+        double diff = diffTerm_cyl(i);
+        dT[i] = diff + (src / denom);
+    }
+}
+void rk4_step(double h){
+    std::vector<double> T0=S.Tr, k1(S.Nr), k2(S.Nr), k3(S.Nr), k4(S.Nr);
+    compute_dTr(k1);
+    for(int i=0;i<S.Nr;i++) S.Tr[i] = T0[i] + 0.5*h*k1[i];
+    compute_dTr(k2);
+    for(int i=0;i<S.Nr;i++) S.Tr[i] = T0[i] + 0.5*h*k2[i];
+    compute_dTr(k3);
+    for(int i=0;i<S.Nr;i++) S.Tr[i] = T0[i] + h*k3[i];
+    compute_dTr(k4);
+    for(int i=0;i<S.Nr;i++){
+        double Tn = T0[i] + (h/6.0)*(k1[i]+2*k2[i]+2*k3[i]+k4[i]);
+        S.Tr[i] = std::max(0.0, Tn);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 2D drawing helpers
+// -----------------------------------------------------------------------------
+static inline void setViewport(int x,int y,int w,int h){ glViewport(x,y,w,h); }
+static inline void drawText(float x,float y,const char* s, void* font=GLUT_BITMAP_9_BY_15){
+    glRasterPos2f(x,y); for(const char* c=s; *c; ++c) glutBitmapCharacter(font,*c);
+}
+static inline void begin2D(int w,int h){
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); gluOrtho2D(0,w,0,h);
+    glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity();
+}
+static inline void end2D(){
+    glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glDisable(GL_BLEND);
+}
+void rectFilled(float x,float y,float w,float h, float a=0.6f){
+    glColor4f(0,0,0,a);
+    glBegin(GL_QUADS); glVertex2f(x,y); glVertex2f(x+w,y); glVertex2f(x+w,y+h); glVertex2f(x,y+h); glEnd();
+    glColor3f(0.82f,0.82f,0.87f);
+    glBegin(GL_LINE_LOOP); glVertex2f(x,y); glVertex2f(x+w,y); glVertex2f(x+w,y+h); glVertex2f(x,y+h); glEnd();
+}
+
+// -----------------------------------------------------------------------------
+// Layout
+// -----------------------------------------------------------------------------
+struct Layout { int W,H;
+    int R3D_x, R3D_y, R3D_w, R3D_h;
+    int RGraph_x, RGraph_y, RGraph_w, RGraph_h;
+    int RPanel_x, RPanel_y, RPanel_w, RPanel_h;
+} L;
+
+void computeLayout(){
+    L.W = glutGet(GLUT_WINDOW_WIDTH);
+    L.H = glutGet(GLUT_WINDOW_HEIGHT);
+
+    int gap = UIX.gap();
+    // Right column ~32% of width, with a DPI-aware minimum
+    int rightW = std::max(UIX.panelMinW(), (int)(0.32f*(float)L.W));
+    int leftW  = L.W - rightW - 3*gap;
+    int topH   = (int)(0.60 * (L.H - 2*gap));
+    int botH   = L.H - topH - 3*gap;
+
+    L.R3D_x = gap;
+    L.R3D_y = L.H - gap - topH;
+    L.R3D_w = leftW;
+    L.R3D_h = topH;
+
+    L.RGraph_x = gap;
+    L.RGraph_y = gap;
+    L.RGraph_w = leftW;
+    L.RGraph_h = botH;
+
+    L.RPanel_x = L.W - rightW - gap;
+    L.RPanel_y = gap;
+    L.RPanel_w = rightW;
+    L.RPanel_h = L.H - 2*gap;
+}
+
+// -----------------------------------------------------------------------------
+// 3D view
+// -----------------------------------------------------------------------------
+void glowingMaterial(double Tavg){
+    double x = std::clamp(Tavg/20.0, 0.0, 1.0);
+    GLfloat c[4]={(GLfloat)(0.18+0.82*x),(GLfloat)(0.40+0.60*x),(GLfloat)1.0,1.0};
+    GLfloat e[4]={(GLfloat)(0.00+1.5*x),(GLfloat)(0.20+1.2*x),(GLfloat)1.5f*(GLfloat)x,1.0};
+    glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, c);
+    glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, e);
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 40.0f);
+}
+void render3D(){
+    setViewport(L.R3D_x, L.R3D_y, L.R3D_w, L.R3D_h);
+    glEnable(GL_DEPTH_TEST);
+    glClear(GL_DEPTH_BUFFER_BIT);
+
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    gluPerspective(55.0, L.R3D_w/(double)std::max(1,L.R3D_h), 0.1, 100.0);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+
+    glTranslatef(0,0,-S.camDist);
+    glRotatef(S.camPitch,1,0,0); glRotatef(S.camYaw,0,1,0);
+
+    glEnable(GL_LIGHTING); glEnable(GL_LIGHT0);
+    GLfloat Lpos[]={2.f,3.f,4.f,1.f}, Lcol[]={0.9f,0.9f,0.9f,1.f};
+    glLightfv(GL_LIGHT0, GL_POSITION, Lpos); glLightfv(GL_LIGHT0, GL_DIFFUSE, Lcol);
+
+    double R=S.P.R0, r=S.P.a; double scale = 1.5/(R+r);
+    glScaled(scale,scale,scale);
+
+    glDisable(GL_LIGHTING);
+    glColor3f(0.65f,0.65f,0.70f); glutWireTorus(r, R, 22, 68);
+
+    glEnable(GL_LIGHTING);
+    glowingMaterial(S.Tavg);
+    glutSolidTorus(r, R, 48, 128);
+
+    glDisable(GL_LIGHTING);
+    glPointSize(3.f);
+    glBegin(GL_POINTS);
+    int n = std::min(1200, (int)(5 + 1800.0 * S.Pfus_avg / (1e8)));
+    for(int i=0;i<n;i++){
+        double a1=((double)rand()/RAND_MAX)*2.0*M_PI;
+        double a2=((double)rand()/RAND_MAX)*2.0*M_PI;
+        double x=(R + r*cos(a2))*cos(a1);
+        double y=(R + r*cos(a2))*sin(a1);
+        double z= r * sin(a2);
+        glColor3f(1.0f,0.92f,0.25f); glVertex3f((float)x,(float)y,(float)z);
+    }
+    glEnd();
+}
+
+// -----------------------------------------------------------------------------
+// Graph + profile inset
+// -----------------------------------------------------------------------------
+void renderProfileInset(){
+    if(!S.showProfileInset) return;
+
+    int w = UIX.insetW(L.RGraph_w);
+    int h = UIX.insetH(L.RGraph_h);
+    int x = L.RGraph_x + UIX.pad();
+    int y = L.RGraph_y + L.RGraph_h - h - UIX.pad();
+
+    rectFilled(x,y,w,h, 0.55f);
+    glColor3f(0.82f,0.82f,0.87f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(x+8,y+8); glVertex2f(x+w-8,y+8); glVertex2f(x+w-8,y+h-8); glVertex2f(x+8,y+h-8);
+    glEnd();
+
+    double Tmin=1e9,Tmax=-1e9; for(int i=0;i<S.Nr;i++){ Tmin=std::min(Tmin,S.Tr[i]); Tmax=std::max(Tmax,S.Tr[i]); }
+    if(!(Tmax>Tmin)){ Tmin=0; Tmax=std::max(10.0, S.Tcenter*1.2+1.0); }
+
+    glColor3f(0.25f,0.95f,0.35f);
+    glBegin(GL_LINE_STRIP);
+    for(int i=0;i<S.Nr;i++){
+        double r = r_cell(i)/S.P.a; // 0..1
+        double u = (double)(x+8) + (w-16)*r;
+        double v = (double)(y+8) + (h-16)*( (S.Tr[i]-Tmin)/std::max(1e-9,(Tmax-Tmin)) );
+        glVertex2f((float)u,(float)v);
+    }
+    glEnd();
+
+    glColor3f(1,1,1);
+    drawText(x+10, y+h-24, "Profile: T(r) at current time");
+}
+
+void renderGraph(){
+    begin2D(L.W,L.H);
+    rectFilled(L.RGraph_x, L.RGraph_y, L.RGraph_w, L.RGraph_h, 0.55f);
+
+    int cnt = S.wrapped ? State::Nplot : S.head;
+    double tmin = S.wrapped ? S.gt[S.head] : (cnt?S.gt.front():0);
+    double tmax = S.wrapped ? S.gt[(S.head+State::Nplot-1)%State::Nplot] : (cnt?S.gt.back():1);
+    if (tmax<=tmin){ tmin=S.t-1.0; tmax=S.t; }
+    double Tmin=1e9,Tmax=-1e9; for(int i=0;i<cnt;i++){ Tmin=std::min(Tmin,S.gT[i]); Tmax=std::max(Tmax,S.gT[i]); }
+    if(!cnt || Tmin==Tmax){ Tmin=0; Tmax=std::max(10.0,S.Tcenter*1.2+1.0); }
+
+    glColor3f(0.82f,0.82f,0.87f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(L.RGraph_x+10, L.RGraph_y+10);
+    glVertex2f(L.RGraph_x+L.RGraph_w-10, L.RGraph_y+10);
+    glVertex2f(L.RGraph_x+L.RGraph_w-10, L.RGraph_y+L.RGraph_h-10);
+    glVertex2f(L.RGraph_x+10, L.RGraph_y+L.RGraph_h-10);
+    glEnd();
+
+    auto plot = [&](const std::vector<double>& gy, float r,float g,float b){
+        glColor3f(r,g,b);
+        glBegin(GL_LINE_STRIP);
+        for(int i=0;i<cnt;i++){
+            int idx=(S.head+i)%State::Nplot;
+            float X = (float)(L.RGraph_x+10 + (L.RGraph_w-20) * ((S.gt[idx]-tmin)/std::max(1e-9,(tmax-tmin))));
+            float Y = (float)(L.RGraph_y+10 + (L.RGraph_h-20) * ((gy[idx]-Tmin)/std::max(1e-9,(Tmax-Tmin))));
+            glVertex2f(X,Y);
+        }
+        glEnd();
+    };
+    plot(S.gT,    0.2f,0.8f,1.0f);
+    if(S.showPfus)  plot(S.gPfus, 0.1f,1.0f,0.2f);
+    if(S.showPloss) plot(S.gPloss,1.0f,0.6f,0.1f);
+
+    // Probe
+    if(S.probeActive && cnt>0){
+        double t = S.probe_t;
+        double x = L.RGraph_x+10 + (L.RGraph_w-20) * ((t - tmin)/std::max(1e-9,(tmax-tmin)));
+        x = std::clamp(x, (double)L.RGraph_x+10.0, (double)L.RGraph_x+L.RGraph_w-10.0);
+        glColor3f(1,1,0.2f);
+        glBegin(GL_LINES); glVertex2f((float)x, L.RGraph_y+10); glVertex2f((float)x, L.RGraph_y+L.RGraph_h-10); glEnd();
+
+        char b[256];
+        float bx = (float)std::min((double)L.RGraph_x+L.RGraph_w-260.0, std::max((double)L.RGraph_x+14.0, x-120.0));
+        float by = L.RGraph_y + L.RGraph_h - 78;
+        rectFilled(bx, by, 250, 64, 0.75f);
+        glColor3f(1,1,1);
+        snprintf(b,sizeof(b),"t = %.3fs", S.probe_t);       drawText(bx+10, by+40, b);
+        snprintf(b,sizeof(b),"T_center = %.3f keV", S.probe_T);    drawText(bx+10, by+24, b);
+        snprintf(b,sizeof(b),"Pfus=%.2e  Ploss=%.2e (W/m^3)", S.probe_Pfus, S.probe_Ploss);
+        drawText(bx+10, by+8, b);
+    }
+
+    glColor3f(1,1,1);
+    drawText(L.RGraph_x+14, L.RGraph_y+L.RGraph_h-UIX.titleStep(),
+             "Center T(keV) vs time  (F: Pfus, L: Ploss, P: profile inset, click: probe)");
+
+    renderProfileInset();
+    end2D();
+}
+
+// -----------------------------------------------------------------------------
+// Right panel + overlays (help/explain/lab are confined to the panel area now)
+// -----------------------------------------------------------------------------
+void renderPanel(){
+    begin2D(L.W,L.H);
+    rectFilled(L.RPanel_x, L.RPanel_y, L.RPanel_w, L.RPanel_h, 0.55f);
+
+    int x = L.RPanel_x+UIX.pad();
+    int y = L.RPanel_y+L.RPanel_h-UIX.titleStep();
+    int step = UIX.lineStep();
+
+    glColor3f(1,1,1);
+    drawText(x, y, "Tokamak Controls (1D)"); y -= step;
+
+    char line[256];
+    auto field = [&](const char* name, double val, int idx){
+        if (S.edit && S.sel==idx) {
+            glColor3f(0.2f,0.8f,1.0f);
+            rectFilled(L.RPanel_x+UIX.pad()-4, y-6, L.RPanel_w-2*UIX.pad()+8, step, 0.32f);
+            glColor3f(0,0,0);
+            snprintf(line,sizeof(line), "%s: %s", name, S.typing? S.buf.c_str(): "");
+            drawText(x, y, S.typing? line : (snprintf(line,sizeof(line), "%s: %.6g", name, val), line));
+        } else {
+            glColor3f(1,1,1);
+            snprintf(line,sizeof(line), "%s: %.6g", name, val);
+            drawText(x, y, line);
+        }
+        y -= step;
+    };
+
+    // inputs
+    field("n (m^-3)",       S.P.n_m3,     0);
+    field("T0 (keV)",       S.P.T0_keV,   1);
+    field("Pext avg (W/m^3)",   S.P.Pext_Wm3, 2);
+    field("Crad",           S.P.Crad,     3);
+    field("D fraction",     S.P.fracD,    4);
+    field("R0 (m)",         S.P.R0,       5);
+    field("a (m)",          S.P.a,        6);
+    field("B0 (T)",         S.P.B0_T,     7);
+    field("Ip (MA)",        S.P.Ip_MA,    8);
+    field("kappa",          S.P.kappa,    9);
+    field("tauE fixed (s)", S.P.tauE_s,   10);
+    field("chi (m^2/s)",    S.P.chi_m2s,  11);
+    field("T_edge (keV)",   S.P.T_edge_keV, 12);
+    field("Pext peaking p", S.P.pext_peak, 13);
+
+    y -= UIX.pad()/2;
+    glColor3f(1,1,0.85f);
+    snprintf(line,sizeof(line), "[tauE: %s]   [Edge BC: %s (B toggles)]",
+             S.P.autoTau? "AUTO (overlay only)":"FIXED (overlay only)",
+             S.edgeBC==0? "Dirichlet T_edge" : "Neumann dT/dr=0");
+    drawText(x, y, line); y -= step;
+
+    double V = torus_volume(S.P.R0,S.P.a);
+    double Pfus_tot = S.Pfus_avg*V, Pext_tot=S.P.Pext_Wm3*V, Ploss_tot=S.Ploss_avg*V;
+
+    glColor3f(0.9f,0.95f,1);
+    snprintf(line,sizeof(line),"t=%.2fs  Tcenter=%.2f keV  Tavg=%.2f keV", S.t, S.Tcenter, S.Tavg); drawText(x,y,line); y-=step;
+    snprintf(line,sizeof(line),"Pfus_avg=%.2e  Palpha_avg=%.2e  Prad_avg=%.2e (W/m^3)", S.Pfus_avg,S.Palpha_avg,S.Prad_avg); drawText(x,y,line); y-=step;
+    snprintf(line,sizeof(line),"Ploss_avg=%.2e  Pext_avg=%.2e (W/m^3)", S.Ploss_avg, S.P.Pext_Wm3); drawText(x,y,line); y-=step;
+    double Q = (Pext_tot>0)? Pfus_tot/Pext_tot : 0.0;
+    snprintf(line,sizeof(line),"V=%.2f m^3  Pfus_tot=%.2e W  Ploss_tot=%.2e W  Q=%.2f", V, Pfus_tot, Ploss_tot, Q); drawText(x,y,line); y-=step;
+
+    y -= UIX.pad()/2;
+    glColor3f(0.9f,1.0f,0.9f);
+    snprintf(line,sizeof(line),"Controller: %s  Target Tcenter=%.2f keV  Kp=%.2e  (C toggle, T set target, [ ] gain)",
+             S.ctrlOn? "ON":"OFF", S.targetT_keV, S.Kp);
+    drawText(x, y, line); y -= step;
+
+    glColor3f(0.95f,0.95f,1.0f);
+    snprintf(line,sizeof(line),"Logging: %s  (E toggles, file: run_log.csv)", S.logging? "ON":"OFF");
+    drawText(x, y, line); y -= step;
+
+    glColor3f(1.0f,0.95f,0.85f);
+    drawText(x, y, "Presets: 1=MiniTok  2=LargeTok  3=ITER-ish  4=DEMO-ish"); y -= step;
+
+    y -= UIX.pad()/2;
+    glColor3f(0.8f,0.9f,1.0f);
+    drawText(x, y, "F1: Help  ?: Explain  H: Labs  P: profile inset  B: edge BC  F11: fullscreen  U/Shift+U: UI scale"); y -= step;
+    drawText(x, y, "Space: Run/Pause  R: Reset  S: tau overlay  Tab: edit  Enter/Esc: type"); y -= step;
+    drawText(x, y, "+/-: Pext x1.1/0.9  Mouse: drag rotate, wheel zoom  Graph click: probe"); y -= step;
+    drawText(x, y, "F/L: toggle Pfus/Ploss in graph");
+
+    end2D();
+}
+
+// Overlays now render inside the panel so they never cover the 3D or graph
+void renderExplain(){
+    if(!S.explain) return;
+    begin2D(L.W,L.H);
+    int w=L.RPanel_w-2*UIX.pad(), h=(int)std::round(230*UIX.scale);
+    int x=L.RPanel_x+UIX.pad(), y=L.RPanel_y+L.RPanel_h - h - UIX.pad();
+    rectFilled(x,y,w,h,0.85f);
+    int tY = y + h - UIX.titleStep(), step=UIX.lineStep();
+    char b[256];
+    glColor3f(1,1,1); drawText(x+10, tY, "Explain: 1D transport (live)"); tY-=step;
+    glColor3f(0.9,0.95,1.0);
+    snprintf(b,sizeof(b),"∂T/∂t = χ (1/r) ∂r(r ∂r T) + (Pα + Pext − Prad)/(3 n kB K)");
+    drawText(x+10,tY,b); tY-=step;
+    snprintf(b,sizeof(b),"χ=%.3g m²/s  n=%.2e m⁻³  T_edge=%.2f keV  BC=%s",
+             S.P.chi_m2s,S.P.n_m3,S.P.T_edge_keV,S.edgeBC==0? "Dirichlet":"Neumann");
+    drawText(x+10,tY,b); tY-=step;
+    snprintf(b,sizeof(b),"⟨Pfus⟩=%.3e, ⟨Pα⟩=%.3e, ⟨Prad⟩=%.3e, ⟨Ploss⟩=%.3e (W/m³)",S.Pfus_avg,S.Palpha_avg,S.Prad_avg,S.Ploss_avg);
+    drawText(x+10,tY,b); tY-=step;
+    snprintf(b,sizeof(b),"Tcenter=%.2f keV, Tavg=%.2f keV", S.Tcenter, S.Tavg);
+    drawText(x+10,tY,b);
+    end2D();
+}
+void renderHelp(){
+    if(!S.showHelp) return;
+    begin2D(L.W,L.H);
+    int w=L.RPanel_w-2*UIX.pad(), h=(int)std::round(210*UIX.scale);
+    int x=L.RPanel_x+UIX.pad(), y=L.RPanel_y+UIX.pad();
+    rectFilled(x,y,w,h,0.85f);
+    int tY=y+h-UIX.titleStep(), step=UIX.lineStep();
+    glColor3f(1,1,1); drawText(x+10,tY,"Help & Glossary"); tY-=step;
+    glColor3f(0.9f,0.95f,1.0f);
+    drawText(x+10,tY,"Keys: Space(run/pause), R(reset), S(tau overlay), Tab(edit), Enter/Esc(typing), +/- (Pext)"); tY-=step;
+    drawText(x+10,tY,"      1-4(presets), E(log), C/T/[ ] (controller), F/L (plot toggles), P(profile), B(BC)"); tY-=step;
+    drawText(x+10,tY,"      F11(fullscreen), U/Shift+U(UI scale), Mouse drag/wheel(camera), Click graph(probe)"); tY-=step;
+    glColor3f(0.95f,0.95f,1.0f);
+    drawText(x+10,tY,"1D model: χ diffusion in minor radius with local sources; density flat (v1)."); tY-=step;
+    drawText(x+10,tY,"Q ≈ Pfus_tot/Pext_tot (plasma). nTτ shown only as overlay (toy)."); tY-=step;
+    glColor3f(0.9f,1.0f,0.9f); drawText(x+10,y+10,"Educational toy for intuition, not prediction.");
+    end2D();
+}
+void renderLab(){
+    if(!S.showLab) return;
+    begin2D(L.W,L.H);
+    int w=L.RPanel_w-2*UIX.pad(), h=(int)std::round(110*UIX.scale);
+    int x=L.RPanel_x+UIX.pad(), y=L.RPanel_y + L.RPanel_h/2 - h/2;
+    rectFilled(x,y,w,h,0.75f);
+    glColor3f(1,1,1); drawText(x+10,y+h-UIX.titleStep(),"Lab: Lawson overlay");
+    glColor3f(0.9f,0.95f,1.0f); drawText(x+10,y+h-2*UIX.lineStep(),"Raise n/T/τ overlay until nTτ ≥ 1e21.");
+    bool ok = (S.P.autoTau? 1.0 : S.P.tauE_s) * S.P.n_m3 * S.Tavg >= 1e21;
+    glColor3f(ok?0.6f:1.0f, ok?1.0f:0.6f, 0.6f);
+    drawText(x+10, y+12, ok? "✓ Goal met" : "… Keep adjusting to meet the goal");
+    end2D();
+}
+
+// -----------------------------------------------------------------------------
+// Main display
+// -----------------------------------------------------------------------------
+void display(){
+    computeLayout();
+    glClearColor(0.02f,0.02f,0.04f,1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    render3D();
+    renderGraph();
+    renderPanel();
+    renderExplain();
+    renderHelp();
+    renderLab();
+
+    glutSwapBuffers();
+}
+
+// -----------------------------------------------------------------------------
+// Tick + buffers
+// -----------------------------------------------------------------------------
+void pushGraph(){
+    if ((int)S.gt.size() < State::Nplot){
+        S.gt.resize(State::Nplot); S.gT.resize(State::Nplot); S.gPfus.resize(State::Nplot); S.gPloss.resize(State::Nplot);
+    }
+    S.gt[S.head]=S.t; S.gT[S.head]=S.Tcenter; S.gPfus[S.head]=S.Pfus_avg; S.gPloss[S.head]=S.Ploss_avg;
+    S.head=(S.head+1)%State::Nplot; if(S.head==0) S.wrapped=true;
+}
+void tick(int){
+    if(!S.paused){
+        double h_stable = 0.25 * (S.dr*S.dr) / std::max(1e-8, S.P.chi_m2s);
+        int substeps = 6;
+        double h = std::min(5e-4, h_stable);
+        for(int s=0;s<substeps;s++){ rk4_step(h); S.t += h; }
+        if(S.ctrlOn){
+            double err = S.targetT_keV - S.Tcenter;
+            S.P.Pext_Wm3 = std::max(0.0, S.P.Pext_Wm3 + S.Kp * err * 0.016);
+        }
+        updateDiagnostics();
+        if(S.logging && S.logf){
+            fprintf(S.logf,"%.6f,%.6f,%.6f,%.6e,%.6e,%.6e,%.6e,%.6e\n",
+                    S.t, S.Tcenter, S.Tavg, S.Pfus_avg, S.Palpha_avg, S.Ploss_avg, S.Pext_avg, S.Prad_avg);
+            fflush(S.logf);
+        }
+        pushGraph();
+    }
+    glutPostRedisplay();
+    glutTimerFunc(16,tick,0);
+}
+void resetSim(){
+    S.dr = S.P.a / State::Nr;
+    S.Tr.assign(State::Nr, S.P.T0_keV);
+    S.t=0; S.head=0; S.wrapped=false;
+    S.gt.assign(State::Nplot,0.0); S.gT.assign(State::Nplot,S.P.T0_keV);
+    S.gPfus.assign(State::Nplot,0.0); S.gPloss.assign(State::Nplot,0.0);
+    updateDiagnostics();
+}
+
+// -----------------------------------------------------------------------------
+// Input
+// -----------------------------------------------------------------------------
+void applyTyped(){
+    if(!S.typing) return;
+    char* end=nullptr; double v=strtod(S.buf.c_str(), &end);
+    if(end==S.buf.c_str()){ S.typing=false; return; }
+    switch(S.sel){
+        case 0:  S.P.n_m3     = std::max(1e15, v); break;
+        case 1:  S.P.T0_keV   = std::max(0.0, v);  resetSim(); break;
+        case 2:  S.P.Pext_Wm3 = std::max(0.0, v);  break;
+        case 3:  S.P.Crad     = std::max(0.0, v);  break;
+        case 4:  S.P.fracD    = std::clamp(v,0.0,1.0); break;
+        case 5:  S.P.R0       = std::max(0.2, v);  break;
+        case 6:  S.P.a        = std::max(0.05, v); resetSim(); break;
+        case 7:  S.P.B0_T     = std::max(0.1, v);  break;
+        case 8:  S.P.Ip_MA    = std::max(0.1, v);  break;
+        case 9:  S.P.kappa    = std::max(1.0, v);  break;
+        case 10: S.P.tauE_s   = std::max(1e-3, v); break;
+        case 11: S.P.chi_m2s  = std::max(1e-4, v); break;
+        case 12: S.P.T_edge_keV = std::max(0.0, v); break;
+        case 13: S.P.pext_peak  = std::max(0.0, v); break;
+    }
+    S.typing=false;
+}
+void keyboard(unsigned char key, int, int){
+    if(S.typing){
+        if(key==13){ applyTyped(); return; }
+        if(key==27){ S.typing=false; return; }
+        if(key==8 || key==127){ if(!S.buf.empty()) S.buf.pop_back(); return; }
+        if((key>='0'&&key<='9')||key=='-'||key=='+'||key=='.'||key=='e'||key=='E'){ S.buf.push_back((char)key); }
+        return;
+    }
+    switch(key){
+        case 27: std::exit(0);
+        case ' ': S.paused=!S.paused; break;
+        case 'r': case 'R': resetSim(); break;
+
+        case 's': case 'S': S.P.autoTau=!S.P.autoTau; break;
+        case '\t': S.edit=!S.edit; break;
+        case 'p': case 'P': S.showProfileInset=!S.showProfileInset; break;
+        case 'b': case 'B': S.edgeBC = 1 - S.edgeBC; break;
+
+        case '+': S.P.Pext_Wm3*=1.10; break;
+        case '-': S.P.Pext_Wm3*=0.90; break;
+
+        case 'e': case 'E':
+            if(!S.logging){
+                S.logf=fopen("run_log.csv","w");
+                if(S.logf){ fprintf(S.logf,"t_s,Tcenter_keV,Tavg_keV,Pfus_avg,Palpha_avg,Ploss_avg,Pext_avg,Prad_avg\n"); S.logging=true; }
+            }else{ if(S.logf){ fclose(S.logf); S.logf=nullptr; } S.logging=false; }
+            break;
+
+        case 'c': case 'C': S.ctrlOn=!S.ctrlOn; break;
+        case 't': case 'T': S.targetT_keV = std::max(0.0, S.Tcenter); break;
+        case '[': S.Kp = std::max(1e3, S.Kp*0.8); break;
+        case ']': S.Kp = std::min(1e9, S.Kp*1.25); break;
+
+        case 'f': case 'F': S.showPfus=!S.showPfus; break;
+        case 'l': case 'L': S.showPloss=!S.showPloss; break;
+
+        case '1': S.P=PRESETS[0].p; resetSim(); break;
+        case '2': S.P=PRESETS[1].p; resetSim(); break;
+        case '3': S.P=PRESETS[2].p; resetSim(); break;
+        case '4': S.P=PRESETS[3].p; resetSim(); break;
+
+        case '?': S.explain = !S.explain; break;
+        case 'h': case 'H': S.showLab = !S.showLab; break;
+
+        // UI scale
+        case 'u': S.isFullscreen=false; UIX.scale = std::min(2.0f, UIX.scale*1.10f); break;
+        case 'U': S.isFullscreen=false; UIX.scale = std::max(0.8f, UIX.scale/1.10f);  break;
+
+        // start typing when panel active
+        case 13: if(S.edit){ S.typing=true; S.buf.clear(); } break;
+    }
+}
+void special(int key, int, int){
+    if(S.edit){
+        if(key==GLUT_KEY_UP)   S.sel=(S.sel+14-1)%14;
+        if(key==GLUT_KEY_DOWN) S.sel=(S.sel+1)%14;
+        if(key==GLUT_KEY_F1)   S.showHelp=!S.showHelp;
+        return;
+    }
+    switch(key){
+        case GLUT_KEY_LEFT:  S.camYaw -= 3.f; break;
+        case GLUT_KEY_RIGHT: S.camYaw += 3.f; break;
+        case GLUT_KEY_UP:    S.camDist = std::max(1.8f, S.camDist-0.1f); break;
+        case GLUT_KEY_DOWN:  S.camDist = std::min(7.0f, S.camDist+0.1f); break;
+        case GLUT_KEY_F1:    S.showHelp=!S.showHelp; break;
+    }
+}
+void mouse(int button, int state, int x, int y){
+    int y_bottom = L.H - y;
+    if(state==GLUT_DOWN){
+        // graph probe
+        if(button==GLUT_LEFT_BUTTON &&
+           x >= L.RGraph_x+10 && x <= L.RGraph_x+L.RGraph_w-10 &&
+           y_bottom >= L.RGraph_y+10 && y_bottom <= L.RGraph_y+L.RGraph_h-10)
+        {
+            int cnt = S.wrapped ? State::Nplot : S.head;
+            if(cnt>0){
+                double tmin = S.wrapped ? S.gt[S.head] : S.gt.front();
+                double tmax = S.wrapped ? S.gt[(S.head+State::Nplot-1)%State::Nplot] : S.gt[std::max(0,S.head-1)];
+                if (tmax<=tmin){ tmin=S.t-1.0; tmax=S.t; }
+                double u = (x - (L.RGraph_x+10.0)) / (double)(L.RGraph_w-20.0);
+                u = std::clamp(u, 0.0, 1.0);
+                double t_click = tmin + u*(tmax-tmin);
+
+                int best=-1; double bestd=1e100;
+                for(int i=0;i<cnt;i++){
+                    int idx=(S.head+i)%State::Nplot;
+                    double d=std::fabs(S.gt[idx]-t_click);
+                    if(d<bestd){bestd=d; best=idx;}
+                }
+                if(best>=0){
+                    S.probeActive=true; S.probeIdx=best;
+                    S.probe_t = S.gt[best];
+                    S.probe_T = S.gT[best];
+                    S.probe_Pfus = S.gPfus[best];
+                    S.probe_Ploss= S.gPloss[best];
+                }
+            }
+            return;
+        }
+        S.mBtn=button; S.lastX=x; S.lastY=y;
+    } else S.mBtn=0;
+}
+void motion(int x, int y){
+    if(S.mBtn==GLUT_LEFT_BUTTON){
+        S.camYaw   += (x - S.lastX)*0.4f;
+        S.camPitch += (y - S.lastY)*0.3f;
+        S.camPitch = std::clamp(S.camPitch, -85.f, 85.f);
+        S.lastX=x; S.lastY=y;
+    }
+}
+void mouseWheel(int wheel, int dir, int x, int y){
+    (void)wheel; (void)x; (void)y;
+    if(dir>0) S.camDist = std::max(1.6f, S.camDist-0.2f);
+    else      S.camDist = std::min(7.0f, S.camDist+0.2f);
+}
+
+// -----------------------------------------------------------------------------
+// Window init + fullscreen toggle
+// -----------------------------------------------------------------------------
+void initWindow(){
+    // Use screen size; open close to 1080p if available
+    int SW = glutGet(GLUT_SCREEN_WIDTH);
+    int SH = glutGet(GLUT_SCREEN_HEIGHT);
+    int W = std::min(SW, 1920);
+    int H = std::min(SH, 1080);
+    glutInitWindowSize(W,H);
+    glutInitWindowPosition((SW-W)/2, (SH-H)/2);
+    glutCreateWindow("Tokamak Fusion — 1D radial transport (interactive, DPI-scaled)");
+}
+void toggleFullscreen(){
+#ifdef __FREEGLUT_EXT_H__
+    glutFullScreenToggle();
+#else
+    // fallback: maximize by resizing to screen
+    int SW = glutGet(GLUT_SCREEN_WIDTH), SH = glutGet(GLUT_SCREEN_HEIGHT);
+    glutReshapeWindow(SW,SH);
+    glutPositionWindow(0,0);
+#endif
+    S.isFullscreen = !S.isFullscreen;
+}
+
+// -----------------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------------
+int main(int argc, char** argv){
+    S.P = Params{};
+    S.dr = S.P.a / State::Nr;
+    S.Tr.assign(State::Nr, S.P.T0_keV);
+
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_RGBA|GLUT_DOUBLE|GLUT_DEPTH);
+
+    initWindow();
+
+    glEnable(GL_COLOR_MATERIAL);
+    glShadeModel(GL_SMOOTH);
+
+    glutDisplayFunc(display);
+    glutKeyboardFunc(keyboard);
+    glutSpecialFunc([](int key,int x,int y){
+        if(key==GLUT_KEY_F11){ toggleFullscreen(); return; } // F11 = fullscreen toggle
+        special(key,x,y);
+    });
+    glutMouseFunc(mouse);
+    glutMotionFunc(motion);
+#ifdef GLUT_MOUSEWHEEL_FUNC
+    glutMouseWheelFunc(mouseWheel);
+#endif
+    glutTimerFunc(16,tick,0);
+
+    updateDiagnostics();
+    glutMainLoop();
+    return 0;
+}
+ 
